@@ -12,10 +12,20 @@ import os
 import csv
 import pandas as pd
 import requests
+import subprocess
 
 # FIX: Windows specific event loop policy for Playwright
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+# CLOUD COMPATIBILITY: Install Playwright Browser Binaries
+# This is required for Streamlit Cloud as it doesn't have them by default.
+try:
+    # Only run if not on Windows (presumably Cloud) or if needed
+    if sys.platform != 'win32':
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+except:
+    pass
 
 # ==========================================
 # STREAMLIT UI SETUP

@@ -1,2 +1,5 @@
 playwright
+streamlit
+pandas
+requests
 pytest-playwright
