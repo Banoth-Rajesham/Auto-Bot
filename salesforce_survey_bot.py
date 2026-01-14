@@ -98,54 +98,90 @@ class SurveyBot:
         return found
 
     async def _handle_manual_submission(self, p, survey_id, ticket_key, emit):
-        """Launches a VISIBLE browser for the user to complete the found survey."""
-        emit(f"\n🔔 SUCCESS! Launching Interactive Browser for {survey_id}...")
-        
-        # Interactive browser (No Proxy usually, or user system proxy)
-        # We want the USER to fill this, so local IP is best unless specifically requested otherwise.
-        browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
-        context = await browser.new_context(no_viewport=True)
-        page = await context.new_page()
-        
+        """Launches a VISIBLE browser (Local) or WATCHER (Cloud) for the user to complete the found survey."""
         url = BASE_URL.format(survey_id)
+        import sys
+        is_cloud = sys.platform != 'win32'
         
-        try:
-            await page.goto(url, timeout=60000)
-            emit(f"✅ Ready! Ticket: {ticket_key}")
+        if not is_cloud:
+            # === LOCAL WINDOWS MODE (Interactive Browser) ===
+            emit(f"\n🔔 SUCCESS! Launching Interactive Browser for {survey_id}...")
             
-            # Pre-fill helper
+            browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
+            context = await browser.new_context(no_viewport=True)
+            page = await context.new_page()
+            
             try:
-                await page.evaluate("""() => {
-                    document.querySelectorAll('textarea').forEach(t => { t.value = 'Good work'; t.dispatchEvent(new Event('input', {bubbles: true})); });
-                }""")
-            except: pass
+                await page.goto(url, timeout=60000)
+                emit(f"✅ Ready! Ticket: {ticket_key}")
+                
+                # Pre-fill helper
+                try:
+                    await page.evaluate("""() => {
+                        document.querySelectorAll('textarea').forEach(t => { t.value = 'Good work'; t.dispatchEvent(new Event('input', {bubbles: true})); });
+                    }""")
+                except: pass
 
-            emit("⏳ Waiting for you to Submit... (I will detect 'Thank You' page)")
+                emit("⏳ Waiting for you to Submit... (I will detect 'Thank You' page)")
+                
+                success_detected = False
+                while not self.stop_requested:
+                    try:
+                        if page.is_closed():
+                            emit("❌ Browser closed manually.")
+                            self.stop_requested = True
+                            break
+                        
+                        body_text = (await page.inner_text("body")).lower()
+                        if "already been recorded" in body_text or "thank you for your submission" in body_text:
+                            success_detected = True
+                            break
+                    except:
+                        pass
+                    await asyncio.sleep(1)
+                
+                if success_detected:
+                    emit(f"🎉 Completed {survey_id}!")
+                    self.save_completion(ticket_key, survey_id, "Manual Success")
+
+            except Exception as e:
+                emit(f"❌ Error in interactive mode: {e}")
+            finally:
+                await browser.close()
+        
+        else:
+            # === CLOUD / MOBILE MODE (Headless Watcher) ===
+            # We cannot launch a visible browser. We allow the user to click the link on their device.
+            emit(f"🔔 MATCH FOUND! Ticket: {ticket_key}")
+            emit(f"👉 **[CLICK HERE TO OPEN SURVEY]({url})**") 
+            emit("⏳ I am monitoring the status in the background. Please fill and submit it on your device!")
+
+            # Use a headless monitor to wait for completion
+            monitor_browser = await p.chromium.launch(headless=True)
+            page = await monitor_browser.new_page()
             
             success_detected = False
-            while not self.stop_requested:
-                try:
-                    if page.is_closed():
-                        emit("❌ Browser closed manually.")
-                        self.stop_requested = True
-                        break
-                    
-                    body_text = (await page.inner_text("body")).lower()
-                    if "already been recorded" in body_text or "thank you for your submission" in body_text:
-                        success_detected = True
-                        break
-                except:
-                    pass
-                await asyncio.sleep(1)
-            
-            if success_detected:
-                emit(f"🎉 Completed {survey_id}!")
-                self.save_completion(ticket_key, survey_id, "Manual Success")
-
-        except Exception as e:
-            emit(f"❌ Error in interactive mode: {e}")
-        finally:
-            await browser.close()
+            try:
+                while not self.stop_requested:
+                    try:
+                        # Reload page to check status
+                        await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                        body_text = (await page.inner_text("body")).lower()
+                        
+                        if "already been recorded" in body_text or "thank you for your submission" in body_text:
+                            success_detected = True
+                            break
+                        
+                        # Wait before checking again
+                        await asyncio.sleep(5)
+                    except:
+                        await asyncio.sleep(5)
+                
+                if success_detected:
+                    emit(f"🎉 Detected Completion for {survey_id}!")
+                    self.save_completion(ticket_key, survey_id, "Cloud Manual Success")
+            finally:
+                await monitor_browser.close()
 
     async def run_async(self, progress_callback):
         def emit(msg):
@@ -169,7 +205,17 @@ class SurveyBot:
                 # === DIRECT MODE ===
                 emit(f"🚀 Starting Direct Mode for {len(self.tickets)} IDs...")
                 
-                browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
+                # Check Environment
+                import sys
+                is_cloud = sys.platform != 'win32'
+
+                if not is_cloud:
+                    browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
+                else:
+                    # Cloud mode: use headless for scanning, no visual browser
+                    browser = await p.chromium.launch(headless=True)
+                    emit("⚠️ Cloud Mode Detected: I will provide links for you to open manually.")
+
                 context = await browser.new_context(no_viewport=True)
                 page = await context.new_page()
 
@@ -180,28 +226,48 @@ class SurveyBot:
                         emit(f"⏭️ Skipping {sid}")
                         continue
                     
-                    emit(f"🔍 Opening {sid}...")
-                    try:
-                        await page.goto(BASE_URL.format(sid))
-                        try:
-                            txt = (await page.inner_text("body")).lower()
-                            if "thank you" in txt or "already been recorded" in txt:
-                                emit(f"⚠️ {sid} already completed.")
-                                continue
-                        except: pass
-
-                        emit("⏳ Waiting for Submit...")
-                        while True:
-                            if self.stop_requested or page.is_closed(): break
+                    emit(f"🔍 Checking {sid}...")
+                    url = BASE_URL.format(sid)
+                    
+                    if is_cloud:
+                        # Just provide link and wait
+                         emit(f"👉 **[CLICK HERE TO OPEN {sid}]({url})**")
+                         emit("⏳ Waiting for you to submit on your device...")
+                         # Loop check
+                         while True:
+                            if self.stop_requested: break
                             try:
+                                await page.goto(url, timeout=30000)
                                 txt = (await page.inner_text("body")).lower()
                                 if "thank you" in txt or "already been recorded" in txt:
                                     self.save_completion(sid, sid, "Manual Success")
-                                    emit("🎉 Next!")
+                                    emit("🎉 Verified! Next!")
                                     break
                             except: pass
-                            await asyncio.sleep(1)
-                    except: pass
+                            await asyncio.sleep(5)
+                    else:
+                        # Desktop Interactive
+                        try:
+                            await page.goto(url)
+                            try:
+                                txt = (await page.inner_text("body")).lower()
+                                if "thank you" in txt or "already been recorded" in txt:
+                                    emit(f"⚠️ {sid} already completed.")
+                                    continue
+                            except: pass
+
+                            emit("⏳ Waiting for Submit...")
+                            while True:
+                                if self.stop_requested or page.is_closed(): break
+                                try:
+                                    txt = (await page.inner_text("body")).lower()
+                                    if "thank you" in txt or "already been recorded" in txt:
+                                        self.save_completion(sid, sid, "Manual Success")
+                                        emit("🎉 Next!")
+                                        break
+                                except: pass
+                                await asyncio.sleep(1)
+                        except: pass
                 await browser.close()
             
             else:
@@ -236,7 +302,6 @@ class SurveyBot:
                     if self.proxies:
                         curr = random.choice(self.proxies)
                         context_options["proxy"] = {"server": curr}
-                        # emit(f"🛡️ Proxy: {curr}") # Debug
                     
                     scanner_context = await scanner_browser.new_context(**context_options)
 
