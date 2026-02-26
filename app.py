@@ -121,12 +121,12 @@ with st.sidebar:
             st.session_state.logs.append("🗑️ History cleared! All IDs will be retried.")
             st.rerun()
     
-    st.subheader("Performance 🚀")
-    conc_limit = st.slider("Scan Speed (Concurrent Requests)", 10, 200, 50, help="Higher = Faster scan. Uses lightweight HTTP requests, not browser tabs. Default is 50.")
+    st.subheader("Performance \U0001f680")
+    conc_limit = st.slider("Concurrency (per worker)", 10, 300, 100, help="Concurrent HTTP requests per proxy worker. With 5 proxies at 100 = 500 total concurrent requests.")
 
     st.subheader("Timing (Seconds)")
-    min_delay = st.slider("Min Delay Between Batches", 0.0, 5.0, 0.5)
-    max_delay = st.slider("Max Delay Between Batches", 0.0, 10.0, 1.5)
+    min_delay = st.slider("Min Delay Between Batches", 0.0, 5.0, 0.2)
+    max_delay = st.slider("Max Delay Between Batches", 0.0, 10.0, 0.8)
     
     speed_config = (min_delay, max_delay)
     
@@ -175,38 +175,75 @@ with tab1:
 
 
 # ==========================================
-# DASHBOARD TAB
+# DASHBOARD TAB - Results & Download
 # ==========================================
 with tab2:
-    st.title("📊 Performance Analytics")
-    
+    st.title("\U0001f4ca Results & Analytics")
+
+    # --- MATCHED SURVEY LINKS (main feature) ---
+    st.subheader("\U0001f517 Matched Survey Links")
+    results_file = "survey_results.csv"
+    if os.path.exists(results_file):
+        try:
+            rdf = pd.read_csv(results_file)
+            if not rdf.empty:
+                st.success(f"\u2705 {len(rdf)} survey link(s) found! Click links below to open and give ratings.")
+                st.dataframe(rdf, use_container_width=True)
+
+                # Download as CSV
+                csv_data = rdf.to_csv(index=False)
+                st.download_button(
+                    label="\U0001f4e5 Download Results (CSV)",
+                    data=csv_data,
+                    file_name="survey_results.csv",
+                    mime="text/csv",
+                )
+
+                # Download as Excel
+                try:
+                    from io import BytesIO
+                    buffer = BytesIO()
+                    rdf.to_excel(buffer, index=False, engine='openpyxl')
+                    st.download_button(
+                        label="\U0001f4e5 Download Results (Excel)",
+                        data=buffer.getvalue(),
+                        file_name="survey_results.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                except:
+                    pass  # openpyxl not available
+            else:
+                st.info("No matches found yet. Run a scan first.")
+        except Exception as e:
+            st.error(f"Could not load results: {e}")
+    else:
+        st.info("No results file yet. Run a scan to find your ticket links.")
+
+    st.divider()
+
+    # --- SCAN HISTORY ---
+    st.subheader("\U0001f4c8 Scan History")
     if os.path.exists("completed.csv"):
         try:
             df = pd.read_csv("completed.csv")
-            
             if not df.empty:
-                # Basic Metrics
-                total_found = len(df)
-                last_found = df['Timestamp'].iloc[-1]
-                
                 m1, m2, m3 = st.columns(3)
-                m1.metric("Total Surveys Found", total_found)
-                
-                # Chart: Activity over time
+                m1.metric("Total Scans Logged", len(df))
+                m2.metric("Matches Found", len(df[df['Status'].str.contains('Match|Success', na=False)]))
+
                 try:
                     df['dt'] = pd.to_datetime(df['Timestamp'])
                     df['hour'] = df['dt'].dt.hour
                     hourly_counts = df.groupby('hour').size()
-                    
                     st.subheader("Activity Timeline (Hourly)")
                     st.bar_chart(hourly_counts)
                 except:
-                    st.warning("Not enough data for charts yet.")
-                
-                st.subheader("Recent Successes")
+                    pass
+
+                st.subheader("Recent Activity")
                 st.dataframe(df.tail(20))
             else:
-                st.info("No data yet. Run the automation to generate stats.")
+                st.info("No data yet.")
         except Exception as e:
             st.error(f"Could not load analytics: {e}")
     else:

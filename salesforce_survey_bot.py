@@ -4,6 +4,7 @@ import csv
 import os
 import sys
 import itertools
+import math
 from datetime import datetime
 
 import httpx
@@ -13,19 +14,31 @@ import httpx
 # ==========================================
 BASE_URL = "https://bluestarlimited.my.salesforce-sites.com/Survey?surveyinvitationid={}"
 LOG_FILE = "completed.csv"
+RESULTS_FILE = "survey_results.csv"
+MAX_RETRIES = 3  # Retry failed IDs for 100% accuracy
 
-# Common headers to mimic a real browser
-SCAN_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-}
+# Rotate user agents to avoid detection
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+]
+
+
+def _get_headers():
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
 
 
 class SurveyBot:
-    def __init__(self, start_id, end_id, tickets, speed_delay=(0.5, 1.5),
+    def __init__(self, start_id, end_id, tickets, speed_delay=(0.2, 0.8),
                  headless=False, manual_mode=False, auto_submit=False,
-                 batch_size=50, proxies=None):
+                 batch_size=100, proxies=None):
         self.start_id = start_id
         self.end_id = end_id
         self.tickets = list(tickets) if manual_mode else set(tickets)
@@ -34,174 +47,189 @@ class SurveyBot:
         self.stop_requested = False
         self.manual_mode = manual_mode
         self.auto_submit = auto_submit
-        self.batch_size = batch_size  # Now controls concurrent HTTP requests (can be 50-200)
+        self.batch_size = batch_size
         self.proxies = proxies if proxies else []
         self.tickets_normalized = {self._normalize(t) for t in tickets} if not manual_mode else set()
-        # Map normalized -> original for display
         self._ticket_display = {}
         if not manual_mode:
             for t in tickets:
                 self._ticket_display[self._normalize(t)] = t
 
-        if not os.path.exists(LOG_FILE):
-            with open(LOG_FILE, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["Timestamp", "SurveyID", "TicketNumber", "Status"])
+        # All matches found during scan (for export)
+        self.all_matches = []
+
+        # Initialize CSV files
+        for filepath, headers in [
+            (LOG_FILE, ["Timestamp", "SurveyID", "TicketNumber", "Status"]),
+            (RESULTS_FILE, ["Timestamp", "SurveyID", "TicketNumber", "SurveyURL"]),
+        ]:
+            if not os.path.exists(filepath):
+                with open(filepath, 'w', newline='') as f:
+                    csv.writer(f).writerow(headers)
 
     def _normalize(self, text):
         return text.replace(" ", "").replace("\n", "").replace("\r", "").lower()
 
     def log(self, message):
-        """Format log for UI consumption."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         return f"[{timestamp}] {message}"
 
     def save_completion(self, ticket, survey_id, status):
         with open(LOG_FILE, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([datetime.now().isoformat(), survey_id, ticket, status])
+            csv.writer(f).writerow([datetime.now().isoformat(), survey_id, ticket, status])
+
+    def save_result(self, ticket, survey_id, url):
+        """Save matched survey link to results CSV."""
+        with open(RESULTS_FILE, 'a', newline='') as f:
+            csv.writer(f).writerow([datetime.now().isoformat(), survey_id, ticket, url])
+        self.all_matches.append({
+            "Timestamp": datetime.now().isoformat(),
+            "SurveyID": survey_id,
+            "TicketNumber": ticket,
+            "SurveyURL": url,
+        })
 
     # ==========================================================
-    # FAST HTTP SCANNING (replaces slow Playwright scanning)
+    # FAST HTTP SCANNING WITH RETRY
     # ==========================================================
     async def _check_id_http(self, client, semaphore, survey_id):
-        """Check a single survey ID using a fast HTTP GET request."""
+        """Check a single survey ID with retry for 100% accuracy."""
         if self.stop_requested:
             return None
 
         async with semaphore:
             url = BASE_URL.format(survey_id)
-            try:
-                resp = await client.get(url, timeout=15.0, follow_redirects=True)
-                if resp.status_code != 200:
-                    return None
+            for attempt in range(MAX_RETRIES):
+                try:
+                    resp = await client.get(url, timeout=15.0, follow_redirects=True)
+                    if resp.status_code != 200:
+                        if attempt < MAX_RETRIES - 1:
+                            await asyncio.sleep(0.5)
+                            continue
+                        return ("FAILED", survey_id)  # Mark as failed for retry
 
-                content_norm = self._normalize(resp.text)
+                    content_norm = self._normalize(resp.text)
 
-                # Check if any of our tickets appear in the page
-                for t in self.tickets_normalized:
-                    if t in content_norm:
-                        original = self._ticket_display.get(t, t)
-                        return (survey_id, original, url)
+                    for t in self.tickets_normalized:
+                        if t in content_norm:
+                            original = self._ticket_display.get(t, t)
+                            return ("MATCH", survey_id, original, url)
 
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError):
-                return None
-            except Exception:
-                return None
+                    return None  # No match, successfully checked
+
+                except (httpx.TimeoutException, httpx.ConnectError,
+                        httpx.ReadError, httpx.PoolTimeout):
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                        continue
+                    return ("FAILED", survey_id)
+                except Exception:
+                    if attempt < MAX_RETRIES - 1:
+                        continue
+                    return ("FAILED", survey_id)
 
         return None
 
-    async def _scan_batch_http(self, batch, emit, processed_ids):
-        """Scan a batch of IDs concurrently using httpx."""
-        # Filter already processed
-        ids_to_scan = [sid for sid in batch if str(sid) not in processed_ids]
+    async def _scan_chunk_with_proxy(self, chunk_ids, proxy_url, concurrency,
+                                     emit, processed_ids, worker_name):
+        """Scan a chunk of IDs using one proxy with high concurrency."""
+        ids_to_scan = [sid for sid in chunk_ids if str(sid) not in processed_ids]
         if not ids_to_scan:
-            return []
+            return [], []
 
-        # Setup proxy if available
-        proxy_url = None
-        if self.proxies:
-            proxy_url = random.choice(self.proxies)
-
-        semaphore = asyncio.Semaphore(self.batch_size)
+        semaphore = asyncio.Semaphore(concurrency)
+        proxy_label = proxy_url or "Direct"
 
         async with httpx.AsyncClient(
-            headers=SCAN_HEADERS,
+            headers=_get_headers(),
             proxy=proxy_url,
-            verify=False,  # Skip SSL verification for speed
+            verify=False,
             limits=httpx.Limits(
-                max_connections=self.batch_size,
-                max_keepalive_connections=self.batch_size
+                max_connections=concurrency,
+                max_keepalive_connections=concurrency
             ),
         ) as client:
             tasks = [self._check_id_http(client, semaphore, sid) for sid in ids_to_scan]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
         matches = []
+        failed_ids = []
         for res in results:
-            if isinstance(res, tuple) and res is not None:
-                matches.append(res)
+            if isinstance(res, Exception):
+                continue
+            if res is None:
+                continue
+            if res[0] == "MATCH":
+                matches.append((res[1], res[2], res[3]))  # (survey_id, ticket, url)
+            elif res[0] == "FAILED":
+                failed_ids.append(res[1])
 
-        return matches
+        return matches, failed_ids
 
     # ==========================================================
-    # INTERACTIVE SUBMISSION (keeps Playwright for user interaction)
+    # MULTI-PROXY PARALLEL SCAN ENGINE
     # ==========================================================
-    async def _handle_manual_submission(self, p, survey_id, ticket_key, url, emit):
-        """Launches a VISIBLE browser for the user to complete the found survey."""
-        is_cloud = sys.platform != 'win32'
+    async def _parallel_proxy_scan(self, all_ids, emit, processed_ids):
+        """
+        Split ID range across multiple proxies for maximum speed.
+        Each proxy scans its chunk simultaneously.
+        Failed IDs are retried with a different proxy.
+        """
+        # Build list of connections: [None (direct)] + proxies
+        connections = [None]  # Always include direct connection
+        connections.extend(self.proxies)
+        num_workers = len(connections)
 
-        if not is_cloud:
-            # === LOCAL WINDOWS MODE (Interactive Browser) ===
-            emit(f"\n\U0001f514 SUCCESS! Launching Browser for Survey {survey_id} -> Ticket: {ticket_key}")
+        # Calculate concurrency per worker
+        per_worker_conc = max(10, self.batch_size // num_workers)
 
-            browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
-            context = await browser.new_context(no_viewport=True)
-            page = await context.new_page()
+        # Split IDs into chunks, one per worker
+        chunk_size = math.ceil(len(all_ids) / num_workers)
+        chunks = []
+        for i in range(num_workers):
+            start = i * chunk_size
+            end = min(start + chunk_size, len(all_ids))
+            if start < len(all_ids):
+                chunks.append((all_ids[start:end], connections[i]))
 
-            try:
-                await page.goto(url, timeout=60000)
-                emit(f"\u2705 Ready! Ticket: {ticket_key}")
+        emit(f"\U0001f500 Splitting {len(all_ids)} IDs across {len(chunks)} worker(s) "
+             f"({per_worker_conc} concurrent each)")
 
-                # Pre-fill helper
-                try:
-                    await page.evaluate("""() => {
-                        document.querySelectorAll('textarea').forEach(t => {
-                            t.value = 'Good work';
-                            t.dispatchEvent(new Event('input', {bubbles: true}));
-                        });
-                    }""")
-                except:
-                    pass
+        # Launch all workers in parallel
+        all_matches = []
+        all_failed = []
 
-                emit("\u23f3 Waiting for you to Submit... (I will detect 'Thank You' page)")
+        worker_tasks = []
+        for idx, (chunk, proxy) in enumerate(chunks):
+            name = f"W{idx+1}"
+            worker_tasks.append(
+                self._scan_chunk_with_proxy(
+                    chunk, proxy, per_worker_conc, emit, processed_ids, name
+                )
+            )
 
-                success_detected = False
-                while not self.stop_requested:
-                    try:
-                        if page.is_closed():
-                            emit("\u274c Browser closed manually.")
-                            self.stop_requested = True
-                            break
-                        body_text = (await page.inner_text("body")).lower()
-                        if "already been recorded" in body_text or "thank you for your submission" in body_text:
-                            success_detected = True
-                            break
-                    except:
-                        pass
-                    await asyncio.sleep(1)
+        results = await asyncio.gather(*worker_tasks, return_exceptions=True)
 
-                if success_detected:
-                    emit(f"\U0001f389 Completed {survey_id}!")
-                    self.save_completion(ticket_key, survey_id, "Manual Success")
+        for res in results:
+            if isinstance(res, Exception):
+                continue
+            matches, failed = res
+            all_matches.extend(matches)
+            all_failed.extend(failed)
 
-            except Exception as e:
-                emit(f"\u274c Error in interactive mode: {e}")
-            finally:
-                await browser.close()
+        # RETRY failed IDs with a different proxy for 100% accuracy
+        if all_failed and not self.stop_requested:
+            emit(f"\U0001f504 Retrying {len(all_failed)} failed IDs...")
+            retry_proxy = random.choice(connections)
+            retry_matches, still_failed = await self._scan_chunk_with_proxy(
+                all_failed, retry_proxy, per_worker_conc, emit, processed_ids, "RETRY"
+            )
+            all_matches.extend(retry_matches)
 
-        else:
-            # === CLOUD / MOBILE MODE ===
-            emit(f"\U0001f514 MATCH FOUND! Ticket: {ticket_key}")
-            emit(f"\U0001f449 **[CLICK HERE TO OPEN SURVEY]({url})**")
-            emit("\u23f3 Please fill and submit on your device!")
+            if still_failed:
+                emit(f"\u26a0\ufe0f {len(still_failed)} IDs could not be checked (server down?)")
 
-            # Monitor with httpx (no browser needed)
-            try:
-                async with httpx.AsyncClient(headers=SCAN_HEADERS, verify=False) as client:
-                    while not self.stop_requested:
-                        try:
-                            resp = await client.get(url, timeout=15.0, follow_redirects=True)
-                            body_lower = resp.text.lower()
-                            if "already been recorded" in body_lower or "thank you for your submission" in body_lower:
-                                emit(f"\U0001f389 Detected Completion for {survey_id}!")
-                                self.save_completion(ticket_key, survey_id, "Cloud Manual Success")
-                                break
-                        except:
-                            pass
-                        await asyncio.sleep(5)
-            except:
-                pass
+        return all_matches
 
     # ==========================================================
     # MAIN RUN LOGIC
@@ -307,66 +335,132 @@ class SurveyBot:
             await browser.close()
 
     async def _run_scan_mode(self, emit, processed_ids):
-        """FAST scan mode: use httpx to scan IDs, Playwright only for matches."""
-        from playwright.async_api import async_playwright
-
+        """
+        ULTRA-FAST scan mode:
+        - Multi-proxy parallel split for maximum speed
+        - Retry logic for 100% accuracy
+        - Saves ALL matches to CSV (no browser opening)
+        """
         end_text = self.end_id if self.end_id else "Unlimited"
-        total = (self.end_id - self.start_id + 1) if self.end_id else "\u221e"
-        emit(f"\U0001f680 TURBO SCAN: IDs {self.start_id} \u2192 {end_text} ({total} IDs) | Concurrency: {self.batch_size}")
+        total_ids = (self.end_id - self.start_id + 1) if self.end_id else None
+        total_label = str(total_ids) if total_ids else "\u221e"
+        num_proxies = len(self.proxies)
+        num_workers = 1 + num_proxies  # direct + proxies
+
+        emit(f"\U0001f680 ULTRA SCAN: IDs {self.start_id} \u2192 {end_text} ({total_label} IDs)")
         emit(f"\U0001f3af Watching for {len(self.tickets)} ticket(s)")
+        emit(f"\U0001f500 Workers: {num_workers} (1 direct + {num_proxies} proxies) | "
+             f"Concurrency: {self.batch_size}")
+        emit(f"\U0001f504 Retry: {MAX_RETRIES}x per ID for 100% accuracy")
+        emit(f"\U0001f4be Results saved to: {RESULTS_FILE}")
 
         if self.end_id:
-            id_iter = range(self.start_id, self.end_id + 1)
+            all_ids_full = list(range(self.start_id, self.end_id + 1))
         else:
-            id_iter = itertools.count(self.start_id)
+            all_ids_full = None  # Will use iterator for unlimited
 
-        iterator = iter(id_iter)
         total_scanned = 0
         total_matches = 0
         start_time = datetime.now()
 
-        # Scan in mega-batches using httpx
-        while not self.stop_requested:
-            # Collect a large batch
-            batch = []
-            try:
-                for _ in range(self.batch_size):
-                    sid = next(iterator)
-                    batch.append(sid)
-            except StopIteration:
-                pass
+        if all_ids_full is not None:
+            # FINITE RANGE: process in mega-batches
+            mega_batch_size = self.batch_size * max(num_workers, 1)
 
-            if not batch:
-                break
+            for i in range(0, len(all_ids_full), mega_batch_size):
+                if self.stop_requested:
+                    break
 
-            batch_start = datetime.now()
-            emit(f"\u26a1 Scanning {batch[0]}\u2013{batch[-1]} ({len(batch)} IDs)...")
+                mega_batch = all_ids_full[i:i + mega_batch_size]
+                batch_start = datetime.now()
 
-            matches = await self._scan_batch_http(batch, emit, processed_ids)
-            total_scanned += len(batch)
+                emit(f"\u26a1 Scanning {mega_batch[0]}\u2013{mega_batch[-1]} "
+                     f"({len(mega_batch)} IDs)...")
 
-            elapsed = (datetime.now() - batch_start).total_seconds()
-            speed = len(batch) / elapsed if elapsed > 0 else 0
-            emit(f"\u2705 Batch done in {elapsed:.1f}s ({speed:.0f} IDs/sec) | Scanned: {total_scanned}")
+                matches = await self._parallel_proxy_scan(
+                    mega_batch, emit, processed_ids
+                )
+                total_scanned += len(mega_batch)
 
-            if matches:
+                elapsed = (datetime.now() - batch_start).total_seconds()
+                speed = len(mega_batch) / elapsed if elapsed > 0 else 0
+
+                # Save all matches to CSV
+                for survey_id, ticket_key, url in matches:
+                    self.save_result(ticket_key, survey_id, url)
+                    self.save_completion(ticket_key, survey_id, "Scan Match")
+                    processed_ids.add(str(survey_id))
+
                 total_matches += len(matches)
-                emit(f"\u2728 Found {len(matches)} match(es)! Opening...")
 
-                # Use Playwright only for the matched surveys
-                async with async_playwright() as p:
-                    for survey_id, ticket_key, url in matches:
-                        if self.stop_requested:
-                            break
-                        await self._handle_manual_submission(p, survey_id, ticket_key, url, emit)
+                pct = (total_scanned / len(all_ids_full)) * 100
+                eta_sec = (elapsed / len(mega_batch)) * (len(all_ids_full) - total_scanned) if elapsed > 0 else 0
+                eta_min = eta_sec / 60
 
-            # Small delay between batches to avoid rate limiting
-            delay = random.uniform(self.delay_range[0], self.delay_range[1])
-            if not self.stop_requested and delay > 0:
-                await asyncio.sleep(delay)
+                emit(f"\u2705 {elapsed:.1f}s ({speed:.0f} IDs/sec) | "
+                     f"Progress: {total_scanned}/{len(all_ids_full)} ({pct:.1f}%) | "
+                     f"Matches: {total_matches} | ETA: {eta_min:.1f}min")
+
+                if matches:
+                    for sid, tkt, url in matches:
+                        emit(f"  \u2728 Match: Ticket={tkt} | Survey={sid} | {url}")
+
+                # Tiny delay between mega-batches
+                delay = random.uniform(self.delay_range[0], self.delay_range[1])
+                if not self.stop_requested and delay > 0:
+                    await asyncio.sleep(delay)
+        else:
+            # UNLIMITED MODE: stream batches
+            iterator = itertools.count(self.start_id)
+            mega_batch_size = self.batch_size * max(num_workers, 1)
+
+            while not self.stop_requested:
+                mega_batch = []
+                try:
+                    for _ in range(mega_batch_size):
+                        mega_batch.append(next(iterator))
+                except StopIteration:
+                    pass
+
+                if not mega_batch:
+                    break
+
+                batch_start = datetime.now()
+                emit(f"\u26a1 Scanning {mega_batch[0]}\u2013{mega_batch[-1]} "
+                     f"({len(mega_batch)} IDs)...")
+
+                matches = await self._parallel_proxy_scan(
+                    mega_batch, emit, processed_ids
+                )
+                total_scanned += len(mega_batch)
+
+                elapsed = (datetime.now() - batch_start).total_seconds()
+                speed = len(mega_batch) / elapsed if elapsed > 0 else 0
+
+                for survey_id, ticket_key, url in matches:
+                    self.save_result(ticket_key, survey_id, url)
+                    self.save_completion(ticket_key, survey_id, "Scan Match")
+                    processed_ids.add(str(survey_id))
+
+                total_matches += len(matches)
+
+                emit(f"\u2705 {elapsed:.1f}s ({speed:.0f} IDs/sec) | "
+                     f"Scanned: {total_scanned} | Matches: {total_matches}")
+
+                if matches:
+                    for sid, tkt, url in matches:
+                        emit(f"  \u2728 Match: Ticket={tkt} | Survey={sid} | {url}")
+
+                delay = random.uniform(self.delay_range[0], self.delay_range[1])
+                if not self.stop_requested and delay > 0:
+                    await asyncio.sleep(delay)
 
         total_time = (datetime.now() - start_time).total_seconds()
-        emit(f"\U0001f4ca Summary: Scanned {total_scanned} IDs in {total_time:.1f}s | Matches: {total_matches}")
+        emit(f"\n\U0001f4ca FINAL SUMMARY")
+        emit(f"   Scanned: {total_scanned} IDs in {total_time:.1f}s "
+             f"({total_scanned/total_time:.0f} IDs/sec)" if total_time > 0 else "")
+        emit(f"   Matches Found: {total_matches}")
+        emit(f"   Results File: {os.path.abspath(RESULTS_FILE)}")
 
     def run(self, progress_callback=None):
         """Entry point for Synchronous App."""
