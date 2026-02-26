@@ -2,9 +2,11 @@ import asyncio
 import random
 import csv
 import os
+import sys
 import itertools
 from datetime import datetime
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
+import httpx
 
 # ==========================================
 # CONSTANTS & CONFIG
@@ -12,27 +14,42 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 BASE_URL = "https://bluestarlimited.my.salesforce-sites.com/Survey?surveyinvitationid={}"
 LOG_FILE = "completed.csv"
 
+# Common headers to mimic a real browser
+SCAN_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
+
 class SurveyBot:
-    def __init__(self, start_id, end_id, tickets, speed_delay=(2, 5), headless=False, manual_mode=False, auto_submit=False, batch_size=6, proxies=None):
+    def __init__(self, start_id, end_id, tickets, speed_delay=(0.5, 1.5),
+                 headless=False, manual_mode=False, auto_submit=False,
+                 batch_size=50, proxies=None):
         self.start_id = start_id
-        self.end_id = end_id 
-        self.tickets = list(tickets) if manual_mode else set(tickets) 
+        self.end_id = end_id
+        self.tickets = list(tickets) if manual_mode else set(tickets)
         self.delay_range = speed_delay
-        self.headless = headless 
+        self.headless = headless
         self.stop_requested = False
         self.manual_mode = manual_mode
         self.auto_submit = auto_submit
-        self.batch_size = batch_size
+        self.batch_size = batch_size  # Now controls concurrent HTTP requests (can be 50-200)
         self.proxies = proxies if proxies else []
         self.tickets_normalized = {self._normalize(t) for t in tickets} if not manual_mode else set()
-        
+        # Map normalized -> original for display
+        self._ticket_display = {}
+        if not manual_mode:
+            for t in tickets:
+                self._ticket_display[self._normalize(t)] = t
+
         if not os.path.exists(LOG_FILE):
-             with open(LOG_FILE, 'w', newline='') as f:
+            with open(LOG_FILE, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(["Timestamp", "SurveyID/Ticket", "Status"])
+                writer.writerow(["Timestamp", "SurveyID", "TicketNumber", "Status"])
 
     def _normalize(self, text):
-        return text.replace(" ", "").replace("\n", "").lower()
+        return text.replace(" ", "").replace("\n", "").replace("\r", "").lower()
 
     def log(self, message):
         """Format log for UI consumption."""
@@ -44,94 +61,108 @@ class SurveyBot:
             writer = csv.writer(f)
             writer.writerow([datetime.now().isoformat(), survey_id, ticket, status])
 
-    async def _check_id_async(self, context, survey_id):
-        """Scans a single ID within the headless context with Robust Retry."""
-        if self.stop_requested: return None
-        
-        try:
-            page = await context.new_page()
-            # Optimize: Block media to save bandwidth, but allow scripts
-            await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font", "stylesheet"] else route.continue_())
-            
+    # ==========================================================
+    # FAST HTTP SCANNING (replaces slow Playwright scanning)
+    # ==========================================================
+    async def _check_id_http(self, client, semaphore, survey_id):
+        """Check a single survey ID using a fast HTTP GET request."""
+        if self.stop_requested:
+            return None
+
+        async with semaphore:
             url = BASE_URL.format(survey_id)
-            found = None
-            
-            # 1. Load Page with stricter timeout for mass scanning
-            await page.goto(url, timeout=20000, wait_until="domcontentloaded")
-            
-            # 2. Robust Polling for Content
-            max_retries = 3
-            for i in range(max_retries):
-                if self.stop_requested: break
-                
-                wait_time = 2000 if i == 0 else 1500
-                await page.wait_for_timeout(wait_time)
-                
-                # Extract text from ALL frames
-                all_content = ""
-                try:
-                    all_content += await page.inner_text("body", timeout=1000)
-                except: pass
-                
-                for frame in page.frames:
-                    try:
-                        all_content += " " + await frame.inner_text("body", timeout=500)
-                    except: pass
-                
-                content_norm = self._normalize(all_content)
-                
-                # Check for Match
+            try:
+                resp = await client.get(url, timeout=15.0, follow_redirects=True)
+                if resp.status_code != 200:
+                    return None
+
+                content_norm = self._normalize(resp.text)
+
+                # Check if any of our tickets appear in the page
                 for t in self.tickets_normalized:
                     if t in content_norm:
-                        found = (survey_id, t)
-                        break
-                
-                if found:
-                    break
-        except Exception:
-            return None
-        finally:
-            try:
-                await page.close()
-            except: pass
-            
-        return found
+                        original = self._ticket_display.get(t, t)
+                        return (survey_id, original, url)
 
-    async def _handle_manual_submission(self, p, survey_id, ticket_key, emit):
-        """Launches a VISIBLE browser (Local) or WATCHER (Cloud) for the user to complete the found survey."""
-        url = BASE_URL.format(survey_id)
-        import sys
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError):
+                return None
+            except Exception:
+                return None
+
+        return None
+
+    async def _scan_batch_http(self, batch, emit, processed_ids):
+        """Scan a batch of IDs concurrently using httpx."""
+        # Filter already processed
+        ids_to_scan = [sid for sid in batch if str(sid) not in processed_ids]
+        if not ids_to_scan:
+            return []
+
+        # Setup proxy if available
+        proxy_url = None
+        if self.proxies:
+            proxy_url = random.choice(self.proxies)
+
+        semaphore = asyncio.Semaphore(self.batch_size)
+
+        async with httpx.AsyncClient(
+            headers=SCAN_HEADERS,
+            proxy=proxy_url,
+            verify=False,  # Skip SSL verification for speed
+            limits=httpx.Limits(
+                max_connections=self.batch_size,
+                max_keepalive_connections=self.batch_size
+            ),
+        ) as client:
+            tasks = [self._check_id_http(client, semaphore, sid) for sid in ids_to_scan]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        matches = []
+        for res in results:
+            if isinstance(res, tuple) and res is not None:
+                matches.append(res)
+
+        return matches
+
+    # ==========================================================
+    # INTERACTIVE SUBMISSION (keeps Playwright for user interaction)
+    # ==========================================================
+    async def _handle_manual_submission(self, p, survey_id, ticket_key, url, emit):
+        """Launches a VISIBLE browser for the user to complete the found survey."""
         is_cloud = sys.platform != 'win32'
-        
+
         if not is_cloud:
             # === LOCAL WINDOWS MODE (Interactive Browser) ===
-            emit(f"\n🔔 SUCCESS! Launching Interactive Browser for {survey_id}...")
-            
+            emit(f"\n\U0001f514 SUCCESS! Launching Browser for Survey {survey_id} -> Ticket: {ticket_key}")
+
             browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
             context = await browser.new_context(no_viewport=True)
             page = await context.new_page()
-            
+
             try:
                 await page.goto(url, timeout=60000)
-                emit(f"✅ Ready! Ticket: {ticket_key}")
-                
+                emit(f"\u2705 Ready! Ticket: {ticket_key}")
+
                 # Pre-fill helper
                 try:
                     await page.evaluate("""() => {
-                        document.querySelectorAll('textarea').forEach(t => { t.value = 'Good work'; t.dispatchEvent(new Event('input', {bubbles: true})); });
+                        document.querySelectorAll('textarea').forEach(t => {
+                            t.value = 'Good work';
+                            t.dispatchEvent(new Event('input', {bubbles: true}));
+                        });
                     }""")
-                except: pass
+                except:
+                    pass
 
-                emit("⏳ Waiting for you to Submit... (I will detect 'Thank You' page)")
-                
+                emit("\u23f3 Waiting for you to Submit... (I will detect 'Thank You' page)")
+
                 success_detected = False
                 while not self.stop_requested:
                     try:
                         if page.is_closed():
-                            emit("❌ Browser closed manually.")
+                            emit("\u274c Browser closed manually.")
                             self.stop_requested = True
                             break
-                        
                         body_text = (await page.inner_text("body")).lower()
                         if "already been recorded" in body_text or "thank you for your submission" in body_text:
                             success_detected = True
@@ -139,205 +170,210 @@ class SurveyBot:
                     except:
                         pass
                     await asyncio.sleep(1)
-                
+
                 if success_detected:
-                    emit(f"🎉 Completed {survey_id}!")
+                    emit(f"\U0001f389 Completed {survey_id}!")
                     self.save_completion(ticket_key, survey_id, "Manual Success")
 
             except Exception as e:
-                emit(f"❌ Error in interactive mode: {e}")
+                emit(f"\u274c Error in interactive mode: {e}")
             finally:
                 await browser.close()
-        
+
         else:
-            # === CLOUD / MOBILE MODE (Headless Watcher) ===
-            # We cannot launch a visible browser. We allow the user to click the link on their device.
-            emit(f"🔔 MATCH FOUND! Ticket: {ticket_key}")
-            emit(f"👉 **[CLICK HERE TO OPEN SURVEY]({url})**") 
-            emit("⏳ I am monitoring the status in the background. Please fill and submit it on your device!")
+            # === CLOUD / MOBILE MODE ===
+            emit(f"\U0001f514 MATCH FOUND! Ticket: {ticket_key}")
+            emit(f"\U0001f449 **[CLICK HERE TO OPEN SURVEY]({url})**")
+            emit("\u23f3 Please fill and submit on your device!")
 
-            # Use a headless monitor to wait for completion
-            monitor_browser = await p.chromium.launch(headless=True)
-            page = await monitor_browser.new_page()
-            
-            success_detected = False
+            # Monitor with httpx (no browser needed)
             try:
-                while not self.stop_requested:
-                    try:
-                        # Reload page to check status
-                        await page.goto(url, timeout=30000, wait_until="domcontentloaded")
-                        body_text = (await page.inner_text("body")).lower()
-                        
-                        if "already been recorded" in body_text or "thank you for your submission" in body_text:
-                            success_detected = True
-                            break
-                        
-                        # Wait before checking again
+                async with httpx.AsyncClient(headers=SCAN_HEADERS, verify=False) as client:
+                    while not self.stop_requested:
+                        try:
+                            resp = await client.get(url, timeout=15.0, follow_redirects=True)
+                            body_lower = resp.text.lower()
+                            if "already been recorded" in body_lower or "thank you for your submission" in body_lower:
+                                emit(f"\U0001f389 Detected Completion for {survey_id}!")
+                                self.save_completion(ticket_key, survey_id, "Cloud Manual Success")
+                                break
+                        except:
+                            pass
                         await asyncio.sleep(5)
-                    except:
-                        await asyncio.sleep(5)
-                
-                if success_detected:
-                    emit(f"🎉 Detected Completion for {survey_id}!")
-                    self.save_completion(ticket_key, survey_id, "Cloud Manual Success")
-            finally:
-                await monitor_browser.close()
+            except:
+                pass
 
-    async def run_async(self, progress_callback):
+    # ==========================================================
+    # MAIN RUN LOGIC
+    # ==========================================================
+    async def run_async(self, progress_callback=None):
         def emit(msg):
             formatted = self.log(msg)
-            if progress_callback: progress_callback(formatted)
+            if progress_callback:
+                progress_callback(formatted)
             print(formatted)
 
         # Load History
         processed_ids = set()
         if os.path.exists(LOG_FILE):
-             try:
+            try:
                 with open(LOG_FILE, 'r') as f:
                     reader = csv.reader(f)
                     next(reader, None)
                     for row in reader:
-                        if len(row) > 1: processed_ids.add(row[1])
-             except: pass
+                        if len(row) > 1:
+                            processed_ids.add(row[1])
+            except:
+                pass
+
+        if self.manual_mode:
+            await self._run_direct_mode(emit, processed_ids)
+        else:
+            await self._run_scan_mode(emit, processed_ids)
+
+        emit("\U0001f3c1 Automation Finished.")
+
+    async def _run_direct_mode(self, emit, processed_ids):
+        """Direct mode: open each survey ID for manual submission."""
+        from playwright.async_api import async_playwright
+
+        emit(f"\U0001f680 Starting Direct Mode for {len(self.tickets)} IDs...")
+        is_cloud = sys.platform != 'win32'
 
         async with async_playwright() as p:
-            if self.manual_mode:
-                # === DIRECT MODE ===
-                emit(f"🚀 Starting Direct Mode for {len(self.tickets)} IDs...")
-                
-                # Check Environment
-                import sys
-                is_cloud = sys.platform != 'win32'
+            if not is_cloud:
+                browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
+            else:
+                browser = await p.chromium.launch(headless=True)
+                emit("\u26a0\ufe0f Cloud Mode: I will provide links for you to open manually.")
 
-                if not is_cloud:
-                    browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
+            context = await browser.new_context(no_viewport=True)
+            page = await context.new_page()
+
+            for ticket in self.tickets:
+                if self.stop_requested:
+                    break
+                sid = str(ticket).strip()
+                if sid in processed_ids:
+                    emit(f"\u23ed\ufe0f Skipping {sid}")
+                    continue
+
+                emit(f"\U0001f50d Opening {sid}...")
+                url = BASE_URL.format(sid)
+
+                if is_cloud:
+                    emit(f"\U0001f449 **[CLICK HERE TO OPEN {sid}]({url})**")
+                    emit("\u23f3 Waiting for you to submit...")
+                    while True:
+                        if self.stop_requested:
+                            break
+                        try:
+                            await page.goto(url, timeout=30000)
+                            txt = (await page.inner_text("body")).lower()
+                            if "thank you" in txt or "already been recorded" in txt:
+                                self.save_completion(sid, sid, "Manual Success")
+                                emit("\U0001f389 Verified! Next!")
+                                break
+                        except:
+                            pass
+                        await asyncio.sleep(5)
                 else:
-                    # Cloud mode: use headless for scanning, no visual browser
-                    browser = await p.chromium.launch(headless=True)
-                    emit("⚠️ Cloud Mode Detected: I will provide links for you to open manually.")
+                    try:
+                        await page.goto(url)
+                        try:
+                            txt = (await page.inner_text("body")).lower()
+                            if "thank you" in txt or "already been recorded" in txt:
+                                emit(f"\u26a0\ufe0f {sid} already completed.")
+                                continue
+                        except:
+                            pass
 
-                context = await browser.new_context(no_viewport=True)
-                page = await context.new_page()
-
-                for ticket in self.tickets:
-                    if self.stop_requested: break
-                    sid = str(ticket).strip()
-                    if sid in processed_ids: 
-                        emit(f"⏭️ Skipping {sid}")
-                        continue
-                    
-                    emit(f"🔍 Checking {sid}...")
-                    url = BASE_URL.format(sid)
-                    
-                    if is_cloud:
-                        # Just provide link and wait
-                         emit(f"👉 **[CLICK HERE TO OPEN {sid}]({url})**")
-                         emit("⏳ Waiting for you to submit on your device...")
-                         # Loop check
-                         while True:
-                            if self.stop_requested: break
+                        emit("\u23f3 Waiting for Submit...")
+                        while True:
+                            if self.stop_requested or page.is_closed():
+                                break
                             try:
-                                await page.goto(url, timeout=30000)
                                 txt = (await page.inner_text("body")).lower()
                                 if "thank you" in txt or "already been recorded" in txt:
                                     self.save_completion(sid, sid, "Manual Success")
-                                    emit("🎉 Verified! Next!")
+                                    emit("\U0001f389 Next!")
                                     break
-                            except: pass
-                            await asyncio.sleep(5)
-                    else:
-                        # Desktop Interactive
-                        try:
-                            await page.goto(url)
-                            try:
-                                txt = (await page.inner_text("body")).lower()
-                                if "thank you" in txt or "already been recorded" in txt:
-                                    emit(f"⚠️ {sid} already completed.")
-                                    continue
-                            except: pass
-
-                            emit("⏳ Waiting for Submit...")
-                            while True:
-                                if self.stop_requested or page.is_closed(): break
-                                try:
-                                    txt = (await page.inner_text("body")).lower()
-                                    if "thank you" in txt or "already been recorded" in txt:
-                                        self.save_completion(sid, sid, "Manual Success")
-                                        emit("🎉 Next!")
-                                        break
-                                except: pass
-                                await asyncio.sleep(1)
-                        except: pass
-                await browser.close()
-            
-            else:
-                # === SCAN MODE ===
-                end_text = self.end_id if self.end_id else "Unlimited"
-                emit(f"🚀 High-Speed Scan with Anti-Ban Logic {self.start_id}-{end_text}")
-
-                if self.end_id:
-                    id_iter = range(self.start_id, self.end_id + 1)
-                else:
-                    id_iter = itertools.count(self.start_id)
-                
-                iterator = iter(id_iter)
-                
-                scanner_browser = await p.chromium.launch(headless=True)
-                
-                # Context managed inside loop for Proxy Rotation
-                while not self.stop_requested:
-                    batch = []
-                    try:
-                        for _ in range(self.batch_size): 
-                            sid = next(iterator)
-                            if str(sid) not in processed_ids:
-                                batch.append(sid)
-                    except StopIteration:
+                            except:
+                                pass
+                            await asyncio.sleep(1)
+                    except:
                         pass
-                    
-                    if not batch: break
 
-                    # PROXY ROTATION
-                    context_options = {}
-                    if self.proxies:
-                        curr = random.choice(self.proxies)
-                        context_options["proxy"] = {"server": curr}
-                    
-                    scanner_context = await scanner_browser.new_context(**context_options)
+            await browser.close()
 
-                    emit(f"⚡ Scanning batch {batch[0]}-{batch[-1]} (C={self.batch_size})...")
+    async def _run_scan_mode(self, emit, processed_ids):
+        """FAST scan mode: use httpx to scan IDs, Playwright only for matches."""
+        from playwright.async_api import async_playwright
 
-                    try:
-                        tasks = []
-                        for sid in batch:
-                            tasks.append(self._check_id_async(scanner_context, sid))
-                            await asyncio.sleep(0.02) # Faster stagger
-                        
-                        results = await asyncio.gather(*tasks)
-                        
-                        matches = []
-                        for res in results:
-                            if res: matches.append(res)
-                        
-                        matches.sort(key=lambda x: int(x[0])) # Process sequentially
+        end_text = self.end_id if self.end_id else "Unlimited"
+        total = (self.end_id - self.start_id + 1) if self.end_id else "\u221e"
+        emit(f"\U0001f680 TURBO SCAN: IDs {self.start_id} \u2192 {end_text} ({total} IDs) | Concurrency: {self.batch_size}")
+        emit(f"\U0001f3af Watching for {len(self.tickets)} ticket(s)")
 
-                        if matches:
-                            emit(f"✨ Found {len(matches)} matches! Processing...")
-                            for survey_id, ticket_key in matches:
-                                if self.stop_requested: break
-                                await self._handle_manual_submission(p, survey_id, ticket_key, emit)
-                    finally:
-                        await scanner_context.close() # Rotate IP
+        if self.end_id:
+            id_iter = range(self.start_id, self.end_id + 1)
+        else:
+            id_iter = itertools.count(self.start_id)
 
-                await scanner_browser.close()
-        
-        emit("🏁 Automation Finished.")
+        iterator = iter(id_iter)
+        total_scanned = 0
+        total_matches = 0
+        start_time = datetime.now()
+
+        # Scan in mega-batches using httpx
+        while not self.stop_requested:
+            # Collect a large batch
+            batch = []
+            try:
+                for _ in range(self.batch_size):
+                    sid = next(iterator)
+                    batch.append(sid)
+            except StopIteration:
+                pass
+
+            if not batch:
+                break
+
+            batch_start = datetime.now()
+            emit(f"\u26a1 Scanning {batch[0]}\u2013{batch[-1]} ({len(batch)} IDs)...")
+
+            matches = await self._scan_batch_http(batch, emit, processed_ids)
+            total_scanned += len(batch)
+
+            elapsed = (datetime.now() - batch_start).total_seconds()
+            speed = len(batch) / elapsed if elapsed > 0 else 0
+            emit(f"\u2705 Batch done in {elapsed:.1f}s ({speed:.0f} IDs/sec) | Scanned: {total_scanned}")
+
+            if matches:
+                total_matches += len(matches)
+                emit(f"\u2728 Found {len(matches)} match(es)! Opening...")
+
+                # Use Playwright only for the matched surveys
+                async with async_playwright() as p:
+                    for survey_id, ticket_key, url in matches:
+                        if self.stop_requested:
+                            break
+                        await self._handle_manual_submission(p, survey_id, ticket_key, url, emit)
+
+            # Small delay between batches to avoid rate limiting
+            delay = random.uniform(self.delay_range[0], self.delay_range[1])
+            if not self.stop_requested and delay > 0:
+                await asyncio.sleep(delay)
+
+        total_time = (datetime.now() - start_time).total_seconds()
+        emit(f"\U0001f4ca Summary: Scanned {total_scanned} IDs in {total_time:.1f}s | Matches: {total_matches}")
 
     def run(self, progress_callback=None):
         """Entry point for Synchronous App."""
         asyncio.run(self.run_async(progress_callback))
 
+
 if __name__ == "__main__":
-    tix = ["I26011331368784"] 
+    tix = ["I26011331368784"]
     bot = SurveyBot(0, 0, tix, headless=False, manual_mode=True)
     bot.run()

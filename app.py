@@ -122,11 +122,11 @@ with st.sidebar:
             st.rerun()
     
     st.subheader("Performance 🚀")
-    conc_limit = st.slider("Scan Speed (Background Tabs)", 1, 25, 8, help="Higher = Faster, but requires better internet. Default is 8.")
+    conc_limit = st.slider("Scan Speed (Concurrent Requests)", 10, 200, 50, help="Higher = Faster scan. Uses lightweight HTTP requests, not browser tabs. Default is 50.")
 
     st.subheader("Timing (Seconds)")
-    min_delay = st.slider("Min Delay", 0.0, 5.0, 2.0)
-    max_delay = st.slider("Max Delay", 1.0, 10.0, 5.0)
+    min_delay = st.slider("Min Delay Between Batches", 0.0, 5.0, 0.5)
+    max_delay = st.slider("Max Delay Between Batches", 0.0, 10.0, 1.5)
     
     speed_config = (min_delay, max_delay)
     

@@ -2,4 +2,5 @@ playwright
 streamlit
 pandas
 requests
+httpx
 pytest-playwright
