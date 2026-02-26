@@ -57,6 +57,8 @@ class SurveyBot:
 
         # All matches found during scan (for export)
         self.all_matches = []
+        # Track which tickets have been matched (for auto-stop)
+        self.matched_tickets = set()
 
         # Initialize CSV files
         for filepath, headers in [
@@ -88,6 +90,13 @@ class SurveyBot:
             "TicketNumber": ticket,
             "SurveyURL": url,
         })
+        self.matched_tickets.add(self._normalize(ticket))
+
+    def all_tickets_found(self):
+        """Check if every ticket has at least one matching survey link."""
+        if not self.tickets_normalized:
+            return False
+        return self.tickets_normalized.issubset(self.matched_tickets)
 
     # ==========================================================
     # FAST HTTP SCANNING WITH RETRY
@@ -353,6 +362,8 @@ class SurveyBot:
              f"Concurrency: {self.batch_size}")
         emit(f"\U0001f504 Retry: {MAX_RETRIES}x per ID for 100% accuracy")
         emit(f"\U0001f4be Results saved to: {RESULTS_FILE}")
+        if not self.end_id:
+            emit(f"\U0001f6d1 Auto-stop: Will stop when all {len(self.tickets)} ticket(s) are found")
 
         if self.end_id:
             all_ids_full = list(range(self.start_id, self.end_id + 1))
@@ -369,6 +380,9 @@ class SurveyBot:
 
             for i in range(0, len(all_ids_full), mega_batch_size):
                 if self.stop_requested:
+                    break
+                if self.all_tickets_found():
+                    emit(f"\U0001f389 ALL {len(self.tickets)} ticket(s) matched! Stopping early.")
                     break
 
                 mega_batch = all_ids_full[i:i + mega_batch_size]
@@ -392,6 +406,9 @@ class SurveyBot:
                     processed_ids.add(str(survey_id))
 
                 total_matches += len(matches)
+                found = len(self.matched_tickets)
+                total_tix = len(self.tickets)
+                remaining = total_tix - found
 
                 pct = (total_scanned / len(all_ids_full)) * 100
                 eta_sec = (elapsed / len(mega_batch)) * (len(all_ids_full) - total_scanned) if elapsed > 0 else 0
@@ -399,7 +416,7 @@ class SurveyBot:
 
                 emit(f"\u2705 {elapsed:.1f}s ({speed:.0f} IDs/sec) | "
                      f"Progress: {total_scanned}/{len(all_ids_full)} ({pct:.1f}%) | "
-                     f"Matches: {total_matches} | ETA: {eta_min:.1f}min")
+                     f"Matches: {total_matches} | Tickets: {found}/{total_tix} | ETA: {eta_min:.1f}min")
 
                 if matches:
                     for sid, tkt, url in matches:
@@ -415,6 +432,11 @@ class SurveyBot:
             mega_batch_size = self.batch_size * max(num_workers, 1)
 
             while not self.stop_requested:
+                # Auto-stop when all tickets are found
+                if self.all_tickets_found():
+                    emit(f"\U0001f389 ALL {len(self.tickets)} ticket(s) matched! Auto-stopping.")
+                    break
+
                 mega_batch = []
                 try:
                     for _ in range(mega_batch_size):
@@ -443,9 +465,13 @@ class SurveyBot:
                     processed_ids.add(str(survey_id))
 
                 total_matches += len(matches)
+                found = len(self.matched_tickets)
+                total_tix = len(self.tickets)
+                remaining = total_tix - found
 
                 emit(f"\u2705 {elapsed:.1f}s ({speed:.0f} IDs/sec) | "
-                     f"Scanned: {total_scanned} | Matches: {total_matches}")
+                     f"Scanned: {total_scanned} | Matches: {total_matches} | "
+                     f"Tickets: {found}/{total_tix} ({remaining} remaining)")
 
                 if matches:
                     for sid, tkt, url in matches:
